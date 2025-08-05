@@ -11,6 +11,7 @@ Imports System.Windows
 Imports System.Windows.Media.Imaging
 Imports Microsoft.Web.WebView2.Core
 
+
 Namespace DatiInterfOracleSpatial
     ''' <summary>
     ''' Finestra overlay GIS-like: carica solo bounds all'avvio, punti solo su richiesta e in base allo zoom.
@@ -29,6 +30,18 @@ Namespace DatiInterfOracleSpatial
         Private Const COLOR_SCALE_MIN As Double = -5
         Private Const COLOR_SCALE_MAX As Double = 5
         Private _isLoadingOverlay As Boolean = False
+
+        ' Dizionario per label custom degli attributi
+        Private ReadOnly _attributeLabels As New Dictionary(Of String, String) From {
+            {"VEL", "Velocità media"},
+            {"HEIGHT", "Quota (m s.l.m.)"},
+            {"COHE", "Coerenza"}',            
+        }
+
+        ' Inserisci tra i campi privati della classe
+        Private ReadOnly _visibleAttributes As New List(Of String) From {
+               "HEIGHT", "H_STDEV", "VEL", "V_STDEV", "COHE" ' ...aggiungi qui solo i campi che vuoi mostrare
+            }
 #End Region
 
 #Region "Inizializzazione"
@@ -177,13 +190,13 @@ Namespace DatiInterfOracleSpatial
         Private Async Function CaricaBoundsDaDB() As Task
             Try
                 Dim query As String = "
-                    SELECT
+                    SELECT /*+ PARALLEL(4) */
                       MIN(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.Y) AS MIN_LAT,
                       MAX(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.Y) AS MAX_LAT,
                       MIN(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.X) AS MIN_LON,
                       MAX(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.X) AS MAX_LON
                     FROM (
-                      SELECT * FROM GEO_DATI_INTERFEROMETRICI_SPATIAL SAMPLE(5)
+                      SELECT  /*+ PARALLEL(4) */ * FROM GEO_DATI_INTERFEROMETRICI_SPATIAL SAMPLE(5)
                       WHERE SDO_GEOM.VALIDATE_GEOMETRY_WITH_CONTEXT(GEOM_SDO, 0.005) = 'TRUE'
                     )"
                 Dim dt = _oracleHelper.ExecuteQuery(query)
@@ -287,43 +300,67 @@ Namespace DatiInterfOracleSpatial
                                       Dim result As New List(Of GeoPoint)()
                                       Try
                                           Dim maxPunti = DeterminaMaxPuntiPerZoom(zoomLevel)
-                                          Dim samplePercent As Integer
-                                          If zoomLevel >= _config.HighZoomThreshold Then
-                                              samplePercent = 50
-                                          ElseIf zoomLevel >= _config.MediumZoomThreshold Then
-                                              samplePercent = 20
-                                          Else
-                                              samplePercent = 5
-                                          End If
-                                          Dim query As String = $"
-                                                            SELECT CODE, VEL,
-                                                                SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X AS LONGITUDE,
-                                                                SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y AS LATITUDE
-                                                            FROM GEO_DATI_INTERFEROMETRICI_SPATIAL SAMPLE({samplePercent})
-                                                            WHERE SDO_FILTER(
-                                                                GEOM_SDO,
-                                                                SDO_GEOMETRY(2003, 4326, NULL,
-                                                                    SDO_ELEM_INFO_ARRAY(1,1003,3),
-                                                                    SDO_ORDINATE_ARRAY(
-                                                                        {bounds.West.ToString(System.Globalization.CultureInfo.InvariantCulture)},
-                                                                        {bounds.South.ToString(System.Globalization.CultureInfo.InvariantCulture)},
-                                                                        {bounds.East.ToString(System.Globalization.CultureInfo.InvariantCulture)},
-                                                                        {bounds.North.ToString(System.Globalization.CultureInfo.InvariantCulture)}
-                                                                    )
+                                          Dim query As String
+                                          Dim samplePercentNullable = _config.GetSamplePercent(zoomLevel)
+
+                                          ' --- LOGICA UNIFICATA: nessun campionamento se samplePercentNullable is Nothing o zoomLevel >= 17 ---
+                                          If Not samplePercentNullable.HasValue OrElse zoomLevel >= 17 Then
+                                              ' Nessun campionamento, prendi tutti i punti nel bounding box (fino a maxPunti)
+                                              query = $"
+                                                        SELECT /*+ PARALLEL(4) */
+                                                            CODE, VEL,
+                                                            SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X AS LONGITUDE,
+                                                            SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y AS LATITUDE
+                                                        FROM GEO_DATI_INTERFEROMETRICI_SPATIAL
+                                                        WHERE SDO_FILTER(
+                                                            GEOM_SDO,
+                                                            SDO_GEOMETRY(2003, 4326, NULL,
+                                                                SDO_ELEM_INFO_ARRAY(1,1003,3),
+                                                                SDO_ORDINATE_ARRAY(
+                                                                    {bounds.West.ToString(System.Globalization.CultureInfo.InvariantCulture)},
+                                                                    {bounds.South.ToString(System.Globalization.CultureInfo.InvariantCulture)},
+                                                                    {bounds.East.ToString(System.Globalization.CultureInfo.InvariantCulture)},
+                                                                    {bounds.North.ToString(System.Globalization.CultureInfo.InvariantCulture)}
                                                                 )
-                                                            ) = 'TRUE'
-                                                            AND ROWNUM <= {maxPunti}
-                                                        "
-                                          LogDebug("Query punti: " & query)
+                                                            )
+                                                        ) = 'TRUE'
+                                                        AND ROWNUM <= {maxPunti}
+                                                    "
+                                          Else
+                                              Dim samplePercent = samplePercentNullable.Value
+                                              query = $"
+                                                        SELECT /*+ PARALLEL(4) */
+                                                            CODE, VEL,
+                                                            SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X AS LONGITUDE,
+                                                            SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y AS LATITUDE
+                                                        FROM GEO_DATI_INTERFEROMETRICI_SPATIAL SAMPLE({samplePercent})
+                                                        WHERE SDO_FILTER(
+                                                            GEOM_SDO,
+                                                            SDO_GEOMETRY(2003, 4326, NULL,
+                                                                SDO_ELEM_INFO_ARRAY(1,1003,3),
+                                                                SDO_ORDINATE_ARRAY(
+                                                                    {bounds.West.ToString(System.Globalization.CultureInfo.InvariantCulture)},
+                                                                    {bounds.South.ToString(System.Globalization.CultureInfo.InvariantCulture)},
+                                                                    {bounds.East.ToString(System.Globalization.CultureInfo.InvariantCulture)},
+                                                                    {bounds.North.ToString(System.Globalization.CultureInfo.InvariantCulture)}
+                                                                )
+                                                            )
+                                                        ) = 'TRUE'
+                                                        AND ROWNUM <= {maxPunti}
+                                                    "
+                                          End If
+
+
+                                          'LogDebug("Query punti: " & query)
                                           Dim dt = _oracleHelper.ExecuteQuery(query)
                                           For Each row As DataRow In dt.Rows
                                               Try
                                                   Dim p As New GeoPoint With {
-                                                      .Id = row("CODE").ToString(),
-                                                      .Value = Convert.ToDouble(row("VEL")),
-                                                      .Longitude = Convert.ToDouble(row("LONGITUDE")),
-                                                      .Latitude = Convert.ToDouble(row("LATITUDE"))
-                                                  }
+                        .Id = row("CODE").ToString(),
+                        .Value = Convert.ToDouble(row("VEL")),
+                        .Longitude = Convert.ToDouble(row("LONGITUDE")),
+                        .Latitude = Convert.ToDouble(row("LATITUDE"))
+                    }
                                                   result.Add(p)
                                               Catch
                                               End Try
@@ -334,7 +371,6 @@ Namespace DatiInterfOracleSpatial
                                       Return result
                                   End Function)
         End Function
-
         Private Async Function RenderPointsAsync(points As List(Of GeoPoint), zoomLevel As Double) As Task
             Try
                 Dim puntiJSON = PreparePointsJson(points)
@@ -405,6 +441,14 @@ Namespace DatiInterfOracleSpatial
                                   End Sub)
             End If
         End Sub
+
+        Private Function GetKeysAsStringList(dict As Dictionary(Of String, Object)) As List(Of String)
+            Dim keys As New List(Of String)
+            For Each k As String In dict.Keys
+                keys.Add(k)
+            Next
+            Return keys
+        End Function
 
         Private Function CalcolaBounds(punti As List(Of GeoPoint)) As BoundingBox
             Dim minLat As Double = Double.MaxValue
@@ -554,70 +598,70 @@ Namespace DatiInterfOracleSpatial
                 End If
 
                 Dim popup As New System.Windows.Controls.Primitives.Popup With {
-                    .Name = "InfoPopup",
-                    .IsOpen = False,
-                    .StaysOpen = True,
-                    .AllowsTransparency = True,
-                    .PopupAnimation = System.Windows.Controls.Primitives.PopupAnimation.Fade,
-                    .Placement = System.Windows.Controls.Primitives.PlacementMode.Absolute
-                }
+            .Name = "InfoPopup",
+            .IsOpen = False,
+            .StaysOpen = True,
+            .AllowsTransparency = True,
+            .PopupAnimation = System.Windows.Controls.Primitives.PopupAnimation.Fade,
+            .Placement = System.Windows.Controls.Primitives.PlacementMode.Absolute
+        }
 
                 Dim border As New Border With {
-                    .BorderBrush = New SolidColorBrush(System.Windows.Media.Colors.Gray),
-                    .BorderThickness = New Thickness(1),
-                    .Background = New SolidColorBrush(System.Windows.Media.Colors.WhiteSmoke),
-                    .CornerRadius = New CornerRadius(4),
-                    .Padding = New Thickness(0),
-                    .MaxHeight = 450,
-                    .Width = 350,
-                    .HorizontalAlignment = HorizontalAlignment.Right,
-                    .VerticalAlignment = VerticalAlignment.Top,
-                    .Effect = New System.Windows.Media.Effects.DropShadowEffect With {
-                        .BlurRadius = 8,
-                        .ShadowDepth = 3,
-                        .Opacity = 0.3
-                    }
-                }
+            .BorderBrush = New SolidColorBrush(System.Windows.Media.Colors.Gray),
+            .BorderThickness = New Thickness(1),
+            .Background = New SolidColorBrush(System.Windows.Media.Colors.WhiteSmoke),
+            .CornerRadius = New CornerRadius(4),
+            .Padding = New Thickness(0),
+            .MaxHeight = 450,
+            .Width = 350,
+            .HorizontalAlignment = HorizontalAlignment.Right,
+            .VerticalAlignment = VerticalAlignment.Top,
+            .Effect = New System.Windows.Media.Effects.DropShadowEffect With {
+                .BlurRadius = 8,
+                .ShadowDepth = 3,
+                .Opacity = 0.3
+            }
+        }
 
                 Dim contentGrid As New Grid()
                 contentGrid.RowDefinitions.Add(New RowDefinition With {.Height = GridLength.Auto})
                 contentGrid.RowDefinitions.Add(New RowDefinition With {.Height = New GridLength(1, GridUnitType.Star)})
 
                 Dim headerPanel As New Grid With {
-                    .Background = New SolidColorBrush(System.Windows.Media.Colors.LightGray)
-                }
+            .Background = New SolidColorBrush(System.Windows.Media.Colors.LightGray)
+        }
 
                 Dim titleTextBlock As New TextBlock With {
-                    .Text = "Informazioni Punto",
-                    .FontWeight = FontWeights.Bold,
-                    .Padding = New Thickness(10, 8, 10, 8),
-                    .VerticalAlignment = VerticalAlignment.Center
-                }
+            .Text = "Informazioni Punto",
+            .FontWeight = FontWeights.Bold,
+            .Padding = New Thickness(10, 8, 10, 8),
+            .VerticalAlignment = VerticalAlignment.Center
+        }
                 headerPanel.Children.Add(titleTextBlock)
 
                 Dim closeButton As New Button With {
-                    .Content = "✕",
-                    .Width = 30,
-                    .Background = New SolidColorBrush(System.Windows.Media.Colors.Transparent),
-                    .BorderThickness = New Thickness(0),
-                    .HorizontalAlignment = HorizontalAlignment.Right,
-                    .Cursor = Cursors.Hand
-                }
+            .Content = "✕",
+            .Width = 30,
+            .Background = New SolidColorBrush(System.Windows.Media.Colors.Transparent),
+            .BorderThickness = New Thickness(0),
+            .HorizontalAlignment = HorizontalAlignment.Right,
+            .Cursor = Cursors.Hand
+        }
                 AddHandler closeButton.Click, Sub(sender, e) popup.IsOpen = False
                 headerPanel.Children.Add(closeButton)
                 Grid.SetRow(headerPanel, 0)
                 contentGrid.Children.Add(headerPanel)
 
                 Dim scrollViewer As New ScrollViewer With {
-                    .VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                    .HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                    .Margin = New Thickness(0)
-                }
+            .VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            .HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            .Margin = New Thickness(0)
+        }
 
                 Dim infoPanel As New StackPanel With {
-                    .Name = "InfoPanel",
-                    .Margin = New Thickness(10)
-                }
+            .Name = "InfoPanel",
+            .Margin = New Thickness(10)
+        }
 
                 If puntiVicini.Count > 0 Then
                     Dim punto = puntiVicini.First().Punto
@@ -628,8 +672,8 @@ Namespace DatiInterfOracleSpatial
 
                     infoPanel.Children.Add(CreateHeaderTextBlock("Posizione (WGS84):", System.Windows.Media.Colors.DarkBlue))
                     infoPanel.Children.Add(CreateValueTextBlock(
-                        $"Lat:{punto.Latitude:F6}(°); Long:{punto.Longitude:F6}(°)"
-                    ))
+                    $"Lat:{punto.Latitude:F6}(°); Long:{punto.Longitude:F6}(°)"
+            ))
 
                     infoPanel.Children.Add(CreateHeaderTextBlock("Valore VEL:", System.Windows.Media.Colors.DarkBlue))
                     infoPanel.Children.Add(CreateValueTextBlock($"{punto.Value:F3}"))
@@ -643,38 +687,95 @@ Namespace DatiInterfOracleSpatial
                         attributeGrid.ColumnDefinitions.Add(New ColumnDefinition With {.Width = New GridLength(1, GridUnitType.Star)})
 
                         Dim row As Integer = 0
-                        For Each key In punto.Attributes.Keys
-                            attributeGrid.RowDefinitions.Add(New RowDefinition With {.Height = GridLength.Auto})
-                            Dim value = punto.Attributes(key)
-                            Dim keyBlock = New TextBlock With {
-                                .Text = key & ":",
-                                .FontWeight = FontWeights.Bold,
-                                .Margin = New Thickness(0, 2, 5, 2),
-                                .VerticalAlignment = VerticalAlignment.Top
-                            }
-                            Grid.SetRow(keyBlock, row)
-                            Grid.SetColumn(keyBlock, 0)
-                            attributeGrid.Children.Add(keyBlock)
+                        'LogDebug("Chiavi attributi disponibili: " & String.Join(",", GetKeysAsStringList(punto.Attributes)))
+                        'LogDebug("Attributi richiesti: " & String.Join(",", _visibleAttributes))
+                        For Each key In _visibleAttributes
+                            If punto.Attributes.ContainsKey(key) Then
+                                'LogDebug("Valore " & key & ": " & Convert.ToString(punto.Attributes(key)))
+                                attributeGrid.RowDefinitions.Add(New RowDefinition With {.Height = GridLength.Auto})
+                                Dim value = punto.Attributes(key)
+                                Dim label As String = If(_attributeLabels.ContainsKey(key), _attributeLabels(key), key)
 
-                            Dim valueText = If(value?.ToString(), "")
-                            If valueText.Length > 100 Then
-                                valueText = valueText.Substring(0, 97) & "..."
+                                Dim keyBlock = New TextBlock With {
+                                                                    .Text = label & ":",
+                                                                    .FontWeight = FontWeights.Bold,
+                                                                    .Margin = New Thickness(0, 2, 5, 2),
+                                                                    .VerticalAlignment = VerticalAlignment.Top
+                                                                }
+                                Grid.SetRow(keyBlock, row)
+                                Grid.SetColumn(keyBlock, 0)
+                                attributeGrid.Children.Add(keyBlock)
+
+                                Dim valueText = If(value?.ToString(), "")
+                                If valueText.Length > 100 Then
+                                    valueText = valueText.Substring(0, 97) & "..."
+                                End If
+
+                                Dim valueBlock = New TextBlock With {
+                                                                        .Text = valueText,
+                                                                        .TextWrapping = TextWrapping.Wrap,
+                                                                        .Margin = New Thickness(0, 2, 0, 2)
+                                                                    }
+                                Grid.SetRow(valueBlock, row)
+                                Grid.SetColumn(valueBlock, 1)
+                                attributeGrid.Children.Add(valueBlock)
+
+                                row += 1
                             End If
-
-                            Dim valueBlock = New TextBlock With {
-                                .Text = valueText,
-                                .TextWrapping = TextWrapping.Wrap,
-                                .Margin = New Thickness(0, 2, 0, 2)
-                            }
-                            Grid.SetRow(valueBlock, row)
-                            Grid.SetColumn(valueBlock, 1)
-                            attributeGrid.Children.Add(valueBlock)
-
-                            row += 1
-                            If row > 25 Then Exit For
                         Next
-
+                        Dim hasD2Attributes As Boolean = False
+                        For Each k In punto.Attributes.Keys
+                            If k IsNot Nothing AndAlso k.ToString().StartsWith("D2", StringComparison.OrdinalIgnoreCase) Then
+                                hasD2Attributes = True
+                                Exit For
+                            End If
+                        Next
                         infoPanel.Children.Add(attributeGrid)
+                        'LogDebug($"Attributi caricati: {String.Join(",", GetKeysAsStringList(punto.Attributes))}")
+                        If hasD2Attributes Then
+                            Dim graphButton As New Button With {
+                        .Content = "Visualizza Grafico",
+                        .Margin = New Thickness(0, 10, 0, 10),
+                        .Padding = New Thickness(10, 5, 10, 5),
+                        .Background = New SolidColorBrush(System.Windows.Media.Colors.LightBlue),
+                        .BorderBrush = New SolidColorBrush(System.Windows.Media.Colors.DarkBlue),
+                        .HorizontalAlignment = HorizontalAlignment.Left
+                    }
+
+                            AddHandler graphButton.Click, Sub(sender, e)
+                                                              Try
+                                                                  Dim ds20Values As New List(Of Double)()
+                                                                  Dim ds20Labels As New List(Of String)()
+                                                                  For Each key As String In punto.Attributes.Keys
+                                                                      If key.StartsWith("D2", StringComparison.OrdinalIgnoreCase) Then
+                                                                          Dim value = punto.Attributes(key)
+                                                                          Dim val As Double
+                                                                          If Double.TryParse(value?.ToString(), Globalization.NumberStyles.Any, Globalization.CultureInfo.InvariantCulture, val) Then
+                                                                              ds20Labels.Add(key)
+                                                                              ds20Values.Add(val)
+                                                                          End If
+                                                                      End If
+                                                                  Next
+
+                                                                  ' Ricava H se presente tra gli attributi
+                                                                  Dim hValue As String = ""
+                                                                  If punto.Attributes.ContainsKey("HEIGHT") Then
+                                                                      hValue = punto.Attributes("HEIGHT").ToString()
+                                                                  End If
+
+                                                                  Dim infoPunto As String = $"Lat:{punto.Latitude:F6}(°); Long:{punto.Longitude:F6}(°); H:{hValue} (m s.l.m.)"
+                                                                  Dim chartWindow As New Ds20ChartWindow(ds20Labels, ds20Values, punto.Value, infoPunto)
+                                                                  chartWindow.Owner = Me
+                                                                  'chartWindow.Topmost = True
+                                                                  chartWindow.ShowDialog()
+                                                              Catch ex As Exception
+                                                                  LogDebug($"Errore apertura grafico: {ex.Message}")
+                                                                  MessageBox.Show("Errore nella visualizzazione del grafico", "Errore", MessageBoxButton.OK, MessageBoxImage.Error)
+                                                              End Try
+                                                          End Sub
+
+                            infoPanel.Children.Add(graphButton)
+                        End If
                     End If
                 End If
 
@@ -702,12 +803,10 @@ Namespace DatiInterfOracleSpatial
                 Catch ex As Exception
                     LogDebug($"Errore nell'evidenziare il punto sulla mappa: {ex.Message}")
                 End Try
-
             Catch ex As Exception
                 LogDebug($"ERRORE CRITICO nella visualizzazione delle informazioni: {ex.Message}")
             End Try
         End Sub
-
         Private Function CreateHeaderTextBlock(text As String, color As System.Windows.Media.Color) As TextBlock
             Return New TextBlock With {
                 .Text = text,
@@ -733,8 +832,8 @@ Namespace DatiInterfOracleSpatial
                     Return attributes
                 End If
                 Dim safeId As String = pointId.Replace("'", "''")
-                Dim query As String = $"SELECT * FROM GEO_DATI_INTERFEROMETRICI_SPATIAL WHERE CODE = '{safeId}'"
-                LogDebug($"Esecuzione query dettagli: {query}")
+                Dim query As String = $"SELECT CODE,HEIGHT,H_STDEV,VEL,V_STDEV,COHE,D20110518,D20110603,D20110721,D20111110,D20111212,D20120113,D20120129,D20120214,D20120402,D20120418,D20120520,D20120605,D20120723,D20120808,D20120824,D20121011,D20121027,D20121112,D20121202,D20121218,D20121226,D20130103,D20130111,D20130119,D20130127,D20130204,D20130212,D20130220,D20130228,D20130308,D20130316,D20130324,D20130401,D20130421,D20130507,D20130523,D20130608,D20130624,D20130710,D20130726,D20130811,D20130827,D20130912,D20131014,D20131030,D20131115,D20131201,D20131217,D20140102,D20140118,D20140203,D20140219,D20140323,D20140408,D20140729,D20140830,D20141001,D20141102,D20141118,D20141220,D20150326,D20150513,D20150817,D20150902,D20150918,D20151004,D20151020,D20151105,D20151207,D20160312,D20160413,D20160429,D20160515,D20160531,D20160702,D20160904,D20160920,D20161006,D20161107,D20161123,D20161225,D20170126,D20170227,D20170502,D20170603,D20170619,D20170705,D20170721,D20170822,D20170923,D20171009,D20171025,D20171110,D20171126,D20171212,D20171228,D20180113,D20180129,D20180318,D20180419,D20180505,D20180521,D20180622,D20180724,D20180910,D20181012,D20181028,D20181113,D20181129,D20181231,D20190217,D20190406,D20190508,D20190604,D20190620,D20190722,D20190807,D20190823,D20190908,D20190924,D20191026,D20200130,D20200215,D20200302,D20200403,D20200622,D20200910,D20200926,D20201012,D20201113,D20210422,D20210524,D20210727,D20210828,D20210929,GEOMETRY,ORIGINE_DATO FROM GEO_DATI_INTERFEROMETRICI_SPATIAL WHERE CODE = '{safeId}'"
+                'LogDebug($"Esecuzione query dettagli: {query}")
                 Dim dt = _oracleHelper.ExecuteQuery(query)
                 If dt Is Nothing Then Return attributes
 
@@ -749,6 +848,7 @@ Namespace DatiInterfOracleSpatial
                             End Try
                         End If
                     Next
+                    'LogDebug("Attributi effettivamente caricati: " & String.Join(",", GetKeysAsStringList(attributes)))
                 End If
             Catch ex As Exception
                 LogDebug($"ERRORE nel caricamento dettagli punto: {ex.Message}")
@@ -867,6 +967,21 @@ Namespace DatiInterfOracleSpatial
             Public Property HighZoomThreshold As Double = 15.0
             Public Property MediumZoomThreshold As Double = 12.0
             Public Property LowZoomThreshold As Double = 9.0
+
+            Public Property SamplePercentLowZoom As Integer = 5
+            Public Property SamplePercentMediumZoom As Integer = 20
+            Public Property SamplePercentHighZoom As Integer = 50
+
+            ' Funzione per ottenere il valore di SAMPLE in base allo zoom
+            Public Function GetSamplePercent(zoomLevel As Double) As Integer?
+                If zoomLevel >= HighZoomThreshold Then
+                    Return Nothing ' Nessun sample per zoom alti
+                ElseIf zoomLevel >= MediumZoomThreshold Then
+                    Return SamplePercentMediumZoom
+                Else
+                    Return SamplePercentLowZoom
+                End If
+            End Function
         End Class
 #End Region
 

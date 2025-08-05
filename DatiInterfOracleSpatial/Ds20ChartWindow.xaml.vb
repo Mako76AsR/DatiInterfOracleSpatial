@@ -11,6 +11,7 @@ Namespace DatiInterfOracleSpatial
         ''' </summary>
         Public Sub New(labels As List(Of String), values As List(Of Double), meanVel As Double, infoPunto As String)
             InitializeComponent()
+
             Dim plotModel = New PlotModel With {
         .Title = "Serie Storica",
         .Subtitle = infoPunto,
@@ -224,6 +225,13 @@ Namespace DatiInterfOracleSpatial
 
             PlotView.Model = plotModel
         End Sub
+
+
+
+
+
+
+
     End Class
 
 End Namespace

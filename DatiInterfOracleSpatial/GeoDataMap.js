@@ -137,6 +137,7 @@ function setupMapEventListeners() {
     map.addListener('bounds_changed', throttle(function () {
         window.chrome.webview.postMessage({
             action: 'bounds_changed',
+            zoom: map.getZoom(), // <-- AGGIUNTO!
             bounds: map.getBounds() ? map.getBounds().toJSON() : null
         });
     }, EVENT_THROTTLE_MS));
@@ -145,6 +146,7 @@ function setupMapEventListeners() {
     map.addListener('idle', function () {
         window.chrome.webview.postMessage({
             action: 'map_idle',
+            zoom: map.getZoom(),
             bounds: map.getBounds() ? map.getBounds().toJSON() : null
         });
     });
@@ -314,11 +316,11 @@ function removeWebGLOverlay() {
             window.pointsOverlay.finalize();
             window.pointsOverlay = null;
         }
-        if (window.boundsOverlay) {
+       /* if (window.boundsOverlay) {
             window.boundsOverlay.setMap(null);
             window.boundsOverlay.finalize();
             window.boundsOverlay = null;
-        }
+        } non voglio cancellare anche i bounds*/
         if (highlightOverlay) {
             highlightOverlay.setMap(null);
             highlightOverlay.finalize();
