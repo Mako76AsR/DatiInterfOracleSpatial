@@ -55,6 +55,10 @@ Namespace DatiInterfOracleSpatial
             LogDebug("OracleConnectionHelper inizializzato")
         End Sub
 
+        ' Carica i valori iniziali all'avvio
+        Private Sub Window_Loaded(sender As Object, e As RoutedEventArgs) Handles Me.Loaded
+            AggiornaFiltri()
+        End Sub
         Private Sub CreaFinestraDebug()
             Dim debugPanel As New DockPanel()
             DockPanel.SetDock(debugPanel, Dock.Bottom)
@@ -119,8 +123,21 @@ Namespace DatiInterfOracleSpatial
         Private Async Sub BtnCaricaDati_Click(sender As Object, e As RoutedEventArgs)
             Try
                 StatusText.Text = "Caricamento bounds da Oracle Spatial..."
-                LogDebug("Caricamento bounds globali")
-                Await CaricaBoundsDaDB()
+                LogDebug("Caricamento bounds filtrati")
+
+                ' Costruisci i filtri
+                Dim filtri As New Dictionary(Of String, List(Of String))
+                If LstSt.SelectedItems.Count > 0 Then filtri("ST") = LstSt.SelectedItems.Cast(Of String).ToList()
+                If LstStrada.SelectedItems.Count > 0 Then filtri("STRADA") = LstStrada.SelectedItems.Cast(Of String).ToList()
+                If LstKmSito.SelectedItems.Count > 0 Then filtri("KM_SITO") = LstKmSito.SelectedItems.Cast(Of String).ToList()
+                If LstSensore.SelectedItems.Count > 0 Then filtri("SENSORE") = LstSensore.SelectedItems.Cast(Of String).ToList()
+                If LstPeriodo.SelectedItems.Count > 0 Then filtri("PERIODO") = LstPeriodo.SelectedItems.Cast(Of String).ToList()
+                If LstTipo.SelectedItems.Count > 0 Then filtri("TIPO") = LstTipo.SelectedItems.Cast(Of String).ToList()
+                If LstDirezione.SelectedItems.Count > 0 Then filtri("DIREZIONE") = LstDirezione.SelectedItems.Cast(Of String).ToList()
+
+                ' Ottieni tutti gli ORIGINE_DATO filtrati
+                Dim origini = _oracleHelper.GetDistinctValuesMulti("GEO_ANAGRAFICA", "ORIGINE_DATO", filtri)
+                Await CaricaBoundsDaDB(origini)
                 StatusText.Text = "Bounds caricati. Premi 'Crea Overlay' per visualizzare i punti."
             Catch ex As Exception
                 LogDebug($"ERRORE durante il caricamento bounds: {ex.Message}")
@@ -138,38 +155,43 @@ Namespace DatiInterfOracleSpatial
                 MessageBox.Show("La mappa non è pronta.", "Mappa non pronta", MessageBoxButton.OK, MessageBoxImage.Warning)
                 Return
             End If
-            If CmbOrigineDato.SelectedIndex < 0 Then
-                MessageBox.Show("Selezionare un'origine dato.", "Origine non selezionata", MessageBoxButton.OK, MessageBoxImage.Warning)
-                Return
-            End If
 
             Try
                 Dim zoomLevelScript = Await WebView.CoreWebView2.ExecuteScriptAsync("map.getZoom()")
+                Dim boundsScript = Await WebView.CoreWebView2.ExecuteScriptAsync("JSON.stringify(map.getBounds().toJSON())")
                 Dim zoomLevel As Double = _config.DefaultZoomLevel
                 If Not String.IsNullOrEmpty(zoomLevelScript) AndAlso zoomLevelScript <> "null" Then
                     zoomLevel = Double.Parse(zoomLevelScript, System.Globalization.CultureInfo.InvariantCulture)
                 End If
 
-                If CmbOrigineDato.SelectedIndex = 0 Then
-                    ' -TUTTI-: carica overlay per tutti i bounds
-                    Dim puntiTotali As New List(Of GeoPoint)
-                    For Each bounds In _allLoadedBounds
-                        _lastLoadedBounds = bounds
-                        Dim punti = Await CaricaPuntiDaDB(bounds, zoomLevel)
-                        puntiTotali.AddRange(punti)
-                    Next
-                    _lastLoadedBounds = CalcolaBounds(puntiTotali)
-                    Await RenderPointsAsync(puntiTotali, zoomLevel)
-                    MostraLegendaColorbar(COLOR_SCALE_MIN, COLOR_SCALE_MAX)
-                    StatusText.Text = $"Visualizzati {puntiTotali.Count} punti (zoom {zoomLevel:F1})"
-                Else
-                    ' Singola origine
-                    Dim idx As Integer = CmbOrigineDato.SelectedIndex - 1
-                    Dim bounds = _allLoadedBounds(idx)
-                    _lastLoadedBounds = bounds
-                    Await UpdateMapOverlayAsync(bounds, zoomLevel)
-                    MostraLegendaColorbar(COLOR_SCALE_MIN, COLOR_SCALE_MAX)
+                Dim viewportBox As BoundingBox = Nothing
+                If boundsScript.StartsWith("""") AndAlso boundsScript.EndsWith("""") Then
+                    boundsScript = boundsScript.Substring(1, boundsScript.Length - 2)
+                    boundsScript = boundsScript.Replace("\""", """") ' Rimuove escape
                 End If
+                If Not String.IsNullOrEmpty(boundsScript) AndAlso boundsScript <> "null" Then
+                    Dim jsBounds = JsonSerializer.Deserialize(Of JsBounds)(boundsScript)
+                    viewportBox = New BoundingBox With {
+        .North = jsBounds.north,
+        .South = jsBounds.south,
+        .East = jsBounds.east,
+        .West = jsBounds.west
+    }
+                End If
+
+                Dim puntiTotali As New List(Of GeoPoint)
+                For Each bound In _allLoadedBounds
+                    Dim intersezione = IntersectBounds(bound, viewportBox)
+                    If intersezione IsNot Nothing Then
+                        _lastLoadedBounds = intersezione
+                        Dim punti = Await CaricaPuntiDaDB(intersezione, zoomLevel)
+                        puntiTotali.AddRange(punti)
+                    End If
+                Next
+                _lastLoadedBounds = CalcolaBounds(puntiTotali)
+                Await RenderPointsAsync(puntiTotali, zoomLevel)
+                MostraLegendaColorbar(COLOR_SCALE_MIN, COLOR_SCALE_MAX)
+                StatusText.Text = $"Visualizzati {puntiTotali.Count} punti (zoom {zoomLevel:F1})"
             Catch ex As Exception
                 LogDebug($"ERRORE durante la creazione overlay: {ex.Message}")
                 StatusText.Text = "Errore nella creazione overlay"
@@ -192,27 +214,41 @@ Namespace DatiInterfOracleSpatial
         ''' <summary>
         ''' Carica solo i bounds globali dal database e li visualizza come rettangolo.
         ''' </summary>
-        Private Async Function CaricaBoundsDaDB() As Task
+        Private Async Function CaricaBoundsDaDB(origini As List(Of String)) As Task
+            'pulisce la mappa prima del nuovo caricamento
+            Await WebView.CoreWebView2.ExecuteScriptAsync("removeWebGLOverlay(); removeGroundOverlays(); clearDeckBounds && clearDeckBounds();")
             Try
-                Dim query As String = "
-            SELECT
-              ORIGINE_DATO,
-              MIN(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.Y) AS MIN_LAT,
-              MAX(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.Y) AS MAX_LAT,
-              MIN(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.X) AS MIN_LON,
-              MAX(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.X) AS MAX_LON
-            FROM (
-              SELECT /*+ PARALLEL(4) */ * FROM GEO_DATI_INTERFEROMETRICI_SPATIAL SAMPLE(5)
-              WHERE SDO_GEOM.VALIDATE_GEOMETRY_WITH_CONTEXT(GEOM_SDO, 0.005) = 'TRUE'
-            )
-            GROUP BY ORIGINE_DATO
-        "
+                If origini Is Nothing OrElse origini.Count = 0 Then
+                    LogDebug("Nessun ORIGINE_DATO selezionato.")
+                    Return
+                End If
+                Dim inClause = String.Join(",", origini.Select(Function(o) $"'{o.Replace("'", "''")}'"))
+                'Dim query As String = $"
+                '                        SELECT
+                '                          ORIGINE_DATO,
+                '                          MIN(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.Y) AS MIN_LAT,
+                '                          MAX(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.Y) AS MAX_LAT,
+                '                          MIN(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.X) AS MIN_LON,
+                '                          MAX(SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.005).SDO_POINT.X) AS MAX_LON
+                '                        FROM GEO_DATI_INTERFEROMETRICI_SPATIAL
+                '                        WHERE ORIGINE_DATO IN ({inClause})
+                '                        GROUP BY ORIGINE_DATO
+                '                    "
+                Dim query As String = $"
+                                        SELECT
+                                          ORIGINE_DATO,
+                                           MIN_LAT,
+                                           MAX_LAT,
+                                           MIN_LON,
+                                           MAX_LON
+                                        FROM GEO_ANAGRAFICA
+                                        WHERE ORIGINE_DATO IN ({inClause})                        
+                                    "
+
                 Dim dt = _oracleHelper.ExecuteQuery(query)
                 _allLoadedBounds.Clear()
-                CmbOrigineDato.Items.Clear()
                 Dim boundsList As New List(Of Object)
                 If dt.Rows.Count > 0 Then
-                    CmbOrigineDato.Items.Add("-TUTTI-")
                     For Each row As DataRow In dt.Rows
                         Dim bounds As New BoundingBox With {
                     .South = Convert.ToDouble(row("MIN_LAT"), Globalization.CultureInfo.InvariantCulture),
@@ -229,12 +265,10 @@ Namespace DatiInterfOracleSpatial
                     .west = bounds.West,
                     .origine = origine
                 })
-                        CmbOrigineDato.Items.Add(origine)
                     Next
-                    CmbOrigineDato.SelectedIndex = 0
                     Dim boundsArrayJson = JsonSerializer.Serialize(boundsList)
                     Await WebView.CoreWebView2.ExecuteScriptAsync($"drawDeckBounds({boundsArrayJson});")
-                    LogDebug("Tutti i bounds caricati e visualizzati.")
+                    LogDebug("Bounds filtrati caricati e visualizzati.")
                 Else
                     LogDebug("Nessun bounds trovato.")
                 End If
@@ -242,6 +276,7 @@ Namespace DatiInterfOracleSpatial
                 LogDebug($"ERRORE caricamento bounds: {ex.Message}")
             End Try
         End Function
+
 #End Region
 
 #Region "Overlay e visualizzazione"
@@ -276,7 +311,7 @@ Namespace DatiInterfOracleSpatial
                     Return
                 End If
 
-                Dim sogliaRaster = 100000
+                Dim sogliaRaster = 10000
                 If punti.Count > sogliaRaster Then
                     LogDebug("Visualizzazione raster base64 (overlay)")
                     Dim imgBase64 = GeneraImmagineBase64(punti, bounds, COLOR_SCALE_MIN, COLOR_SCALE_MAX)
@@ -312,26 +347,40 @@ Namespace DatiInterfOracleSpatial
 
         ''' <summary>
         ''' Query Oracle per caricare solo i punti visibili e campionati.
+        ''' Gestione robusta di errori Oracle (incluso ORA-01013) e dati non validi.
+        ''' </summary>
+        ''' <summary>
+        ''' Carica i punti visibili dal database Oracle, gestendo errori Oracle e dati non validi.
         ''' </summary>
         Private Async Function CaricaPuntiDaDB(bounds As BoundingBox, zoomLevel As Double) As Task(Of List(Of GeoPoint))
             Return Await Task.Run(Function()
                                       Dim result As New List(Of GeoPoint)()
                                       Try
+                                          ' Determina il massimo numero di punti da caricare in base allo zoom
                                           Dim maxPunti = DeterminaMaxPuntiPerZoom(zoomLevel)
                                           Dim query As String
                                           Dim samplePercentNullable = _config.GetSamplePercent(zoomLevel)
 
-                                          ' --- LOGICA UNIFICATA: nessun campionamento se samplePercentNullable is Nothing o zoomLevel >= 17 ---
+                                          ' Costruzione query: sample solo se richiesto dallo zoom
                                           If Not samplePercentNullable.HasValue OrElse zoomLevel >= 17 Then
-                                              ' Nessun campionamento, prendi tutti i punti nel bounding box (fino a maxPunti)
                                               query = $"
                                                         SELECT /*+ PARALLEL(4) */
                                                             CODE, VEL,
-                                                            SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X AS LONGITUDE,
-                                                            SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y AS LATITUDE
-                                                        FROM GEO_DATI_INTERFEROMETRICI_SPATIAL
-                                                        WHERE SDO_FILTER(
-                                                            GEOM_SDO,
+                                                            CENTROIDE_X AS LONGITUDE,
+                                                            CENTROIDE_Y AS LATITUDE
+                                                        FROM (
+                                                            SELECT CODE, VEL,
+                                                                   SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X AS CENTROIDE_X,
+                                                                   SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y AS CENTROIDE_Y,
+                                                                   DATI_VARIABILI, GEOM_SDO
+                                                            FROM GEO_DATI_INTERFEROMETRICI_SPATIAL
+                                                            WHERE DATI_VARIABILI IS NOT NULL
+                                                              AND DBMS_LOB.GETLENGTH(DATI_VARIABILI) > 0
+                                                              AND SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X IS NOT NULL
+                                                              AND SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y IS NOT NULL
+                                                        ) t
+                                                        WHERE SDO_RELATE(
+                                                            t.GEOM_SDO,
                                                             SDO_GEOMETRY(2003, 4326, NULL,
                                                                 SDO_ELEM_INFO_ARRAY(1,1003,3),
                                                                 SDO_ORDINATE_ARRAY(
@@ -340,20 +389,31 @@ Namespace DatiInterfOracleSpatial
                                                                     {bounds.East.ToString(System.Globalization.CultureInfo.InvariantCulture)},
                                                                     {bounds.North.ToString(System.Globalization.CultureInfo.InvariantCulture)}
                                                                 )
-                                                            )
+                                                            ),
+                                                            'mask=ANYINTERACT querytype=WINDOW'
                                                         ) = 'TRUE'
                                                         AND ROWNUM <= {maxPunti}
-                                                    "
+                                                        "
                                           Else
                                               Dim samplePercent = samplePercentNullable.Value
                                               query = $"
                                                         SELECT /*+ PARALLEL(4) */
                                                             CODE, VEL,
-                                                            SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X AS LONGITUDE,
-                                                            SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y AS LATITUDE
-                                                        FROM GEO_DATI_INTERFEROMETRICI_SPATIAL SAMPLE({samplePercent})
-                                                        WHERE SDO_FILTER(
-                                                            GEOM_SDO,
+                                                            CENTROIDE_X AS LONGITUDE,
+                                                            CENTROIDE_Y AS LATITUDE
+                                                        FROM (
+                                                            SELECT CODE, VEL,
+                                                                   SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X AS CENTROIDE_X,
+                                                                   SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y AS CENTROIDE_Y,
+                                                                   GEOM_SDO
+                                                            FROM GEO_DATI_INTERFEROMETRICI_SPATIAL SAMPLE({samplePercent})
+                                                            WHERE DATI_VARIABILI IS NOT NULL
+                                                              AND DBMS_LOB.GETLENGTH(DATI_VARIABILI) > 0
+                                                              AND SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.X IS NOT NULL
+                                                              AND SDO_GEOM.SDO_CENTROID(GEOM_SDO, 0.001).SDO_POINT.Y IS NOT NULL
+                                                        ) t
+                                                        WHERE SDO_RELATE(
+                                                            t.GEOM_SDO,
                                                             SDO_GEOMETRY(2003, 4326, NULL,
                                                                 SDO_ELEM_INFO_ARRAY(1,1003,3),
                                                                 SDO_ORDINATE_ARRAY(
@@ -362,25 +422,82 @@ Namespace DatiInterfOracleSpatial
                                                                     {bounds.East.ToString(System.Globalization.CultureInfo.InvariantCulture)},
                                                                     {bounds.North.ToString(System.Globalization.CultureInfo.InvariantCulture)}
                                                                 )
-                                                            )
+                                                            ),
+                                                            'mask=ANYINTERACT querytype=WINDOW'
                                                         ) = 'TRUE'
                                                         AND ROWNUM <= {maxPunti}
-                                                    "
+                                                        "
                                           End If
 
+                                          LogDebug("Query punti: " & query)
 
-                                          'LogDebug("Query punti: " & query)
-                                          Dim dt = _oracleHelper.ExecuteQuery(query)
+                                          Dim dt As DataTable = Nothing
+                                          Try
+                                              ' Esecuzione query con gestione specifica per ORA-01013 (query annullata)
+                                              dt = _oracleHelper.ExecuteQuery(query)
+                                          Catch ex As Oracle.ManagedDataAccess.Client.OracleException
+                                              If ex.Number = 1013 Then
+                                                  LogDebug("Query annullata dall'utente o timeout Oracle (ORA-01013). Nessun dato caricato.")
+                                                  Return result ' Lista vuota, non propagare errore
+                                              Else
+                                                  LogDebug($"ERRORE Oracle: {ex.Message}")
+                                                  Throw
+                                              End If
+                                          End Try
+
+                                          If dt Is Nothing Then Return result
+
+                                          LogDebug("Righe restituite dalla query: " & dt.Rows.Count)
+
+                                          Dim count As Integer = 0
                                           For Each row As DataRow In dt.Rows
                                               Try
-                                                  Dim p As New GeoPoint With {
-                        .Id = row("CODE").ToString(),
-                        .Value = Convert.ToDouble(row("VEL")),
-                        .Longitude = Convert.ToDouble(row("LONGITUDE")),
-                        .Latitude = Convert.ToDouble(row("LATITUDE"))
-                    }
-                                                  result.Add(p)
-                                              Catch
+                                                  ' Conversione sicura dei dati con controllo su DBNull e TryParse
+                                                  Dim code As String = If(row("CODE") IsNot DBNull.Value, row("CODE").ToString(), "")
+                                                  Dim vel As Double = 0
+                                                  Dim lon As Double = 0
+                                                  Dim lat As Double = 0
+
+                                                  vel = ParseDoubleFlexible(row("VEL"))
+                                                  lon = ParseDoubleFlexible(row("LONGITUDE"))
+                                                  lat = ParseDoubleFlexible(row("LATITUDE"))
+                                                  Dim velOk = Not Double.IsNaN(vel)
+                                                  Dim lonOk = Not Double.IsNaN(lon)
+                                                  Dim latOk = Not Double.IsNaN(lat)
+
+                                                  ' Log dei primi 10 record per debug rapido (con valori convertiti)
+                                                  If count < 10 Then
+                                                      LogDebug($"[DEBUG DATI] CODE={code}, VEL={vel}, LONG={lon}, LAT={lat}")
+                                                      count += 1
+                                                  End If
+
+                                                  If velOk AndAlso lonOk AndAlso latOk Then
+                                                      ' Escludi valori non validi (NaN, Infinity)
+                                                      If Not (Double.IsNaN(vel) OrElse Double.IsInfinity(vel) OrElse
+                                                            Double.IsNaN(lon) OrElse Double.IsInfinity(lon) OrElse
+                                                            Double.IsNaN(lat) OrElse Double.IsInfinity(lat)) Then
+
+                                                          Dim p As New GeoPoint With {
+                                                            .Id = code,
+                                                            .Value = vel,
+                                                            .Longitude = lon,
+                                                            .Latitude = lat
+                                                        }
+                                                          result.Add(p)
+                                                      Else
+                                                          LogDebug($"Punto scartato per valore non valido: CODE={code}, VEL={row("VEL")}, LONG={row("LONGITUDE")}, LAT={row("LATITUDE")}")
+                                                      End If
+                                                  Else
+                                                      LogDebug($"Punto scartato per conversione fallita: CODE={code}, VEL={row("VEL")}, LONG={row("LONGITUDE")}, LAT={row("LATITUDE")}")
+                                                  End If
+
+                                                  ' Log dei primi 10 record per debug rapido
+                                                  If count < 10 Then
+                                                      LogDebug($"[DEBUG DATI] CODE={code}, VEL={row("VEL")}, LONG={row("LONGITUDE")}, LAT={row("LATITUDE")}")
+                                                      count += 1
+                                                  End If
+                                              Catch ex As Exception
+                                                  LogDebug($"ERRORE conversione punto: CODE={row("CODE")}, VEL={row("VEL")}, LONG={row("LONGITUDE")}, LAT={row("LATITUDE")}, Errore: {ex.Message}")
                                               End Try
                                           Next
                                       Catch ex As Exception
@@ -389,54 +506,75 @@ Namespace DatiInterfOracleSpatial
                                       Return result
                                   End Function)
         End Function
+
         Private Async Function RenderPointsAsync(points As List(Of GeoPoint), zoomLevel As Double) As Task
             Try
+                If points Is Nothing OrElse points.Count = 0 Then
+                    LogDebug("Nessun punto da visualizzare, salta RenderPointsAsync.")
+                    Return
+                End If
                 Dim puntiJSON = PreparePointsJson(points)
                 Dim markerRadius As Double = CalcolaGrandezzaMarker(zoomLevel)
                 Dim boundsJson = JsonSerializer.Serialize(New With {
-                    .north = _lastLoadedBounds.North,
-                    .south = _lastLoadedBounds.South,
-                    .east = _lastLoadedBounds.East,
-                    .west = _lastLoadedBounds.West
-                })
+            .north = _lastLoadedBounds.North,
+            .south = _lastLoadedBounds.South,
+            .east = _lastLoadedBounds.East,
+            .west = _lastLoadedBounds.West
+        })
                 Dim script = $"ensureDeckReady().then(() => createWebGLOverlay('{puntiJSON}', {markerRadius}, {zoomLevel.ToString(System.Globalization.CultureInfo.InvariantCulture)}, {boundsJson}));"
                 Await WebView.CoreWebView2.ExecuteScriptAsync(script)
             Catch ex As Exception
                 LogDebug($"ERRORE render points: {ex.Message}")
             End Try
         End Function
-
+        'seralizzo solo i punti validi
         Private Function PreparePointsJson(points As List(Of GeoPoint)) As String
-            Dim puntiJSON As New System.Text.StringBuilder()
-            puntiJSON.Append("[")
-            For i As Integer = 0 To points.Count - 1
-                Dim punto = points(i)
-                Dim colore = ColorUtils.CalcolaColoreRainbow(punto.Value, COLOR_SCALE_MIN, COLOR_SCALE_MAX)
-                puntiJSON.Append($"[{punto.Longitude.ToString(System.Globalization.CultureInfo.InvariantCulture)}, " &
-                 $"{punto.Latitude.ToString(System.Globalization.CultureInfo.InvariantCulture)}, " &
-                 $"{punto.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)}, " &
-                 $"[{colore.R},{colore.G},{colore.B},{colore.Alpha}]]")
-                If i < points.Count - 1 Then
-                    puntiJSON.Append(",")
-                End If
-            Next
-            puntiJSON.Append("]")
-            Return puntiJSON.ToString()
+            Dim validPoints = points.Where(Function(p) _
+        Not (Double.IsNaN(p.Longitude) OrElse Double.IsInfinity(p.Longitude) _
+        OrElse Double.IsNaN(p.Latitude) OrElse Double.IsInfinity(p.Latitude) _
+        OrElse Double.IsNaN(p.Value) OrElse Double.IsInfinity(p.Value)) _
+        AndAlso p.Longitude >= -180 AndAlso p.Longitude <= 180 _
+        AndAlso p.Latitude >= -90 AndAlso p.Latitude <= 90
+    ).Select(Function(p)
+                 Dim lon = If(Double.IsInfinity(p.Longitude) OrElse Double.IsNaN(p.Longitude), 0, p.Longitude)
+                 Dim lat = If(Double.IsInfinity(p.Latitude) OrElse Double.IsNaN(p.Latitude), 0, p.Latitude)
+                 Dim val = If(Double.IsInfinity(p.Value) OrElse Double.IsNaN(p.Value), 0, p.Value)
+                 Dim colore = ColorUtils.CalcolaColoreRainbow(val, COLOR_SCALE_MIN, COLOR_SCALE_MAX)
+                 Return New Object() {
+            lon,
+            lat,
+            val,
+            New Integer() {colore.R, colore.G, colore.B, colore.Alpha}
+        }
+             End Function).ToList()
+            LogDebug($"[DEBUG] Punti validi serializzati: {validPoints.Count}")
+            If validPoints.Count = 0 Then Return "[]"
+            Return JsonSerializer.Serialize(validPoints)
         End Function
 
         Private Function GeneraImmagineBase64(punti As List(Of GeoPoint), bounds As BoundingBox, minValue As Double, maxValue As Double) As String
             Dim width As Integer = 1024
             Dim height As Integer = 1024
+
+            If bounds.East = bounds.West OrElse bounds.North = bounds.South Then
+                LogDebug("ERRORE: bounds non validi per rasterizzazione (East=West o North=South)")
+                Return ""
+            End If
+
             Dim bmp As New Bitmap(width, height)
             Using g As Graphics = Graphics.FromImage(bmp)
                 g.Clear(Color.Transparent)
                 For Each punto In punti
-                    Dim x = CInt((punto.Longitude - bounds.West) / (bounds.East - bounds.West) * width)
-                    Dim y = CInt((bounds.North - punto.Latitude) / (bounds.North - bounds.South) * height)
-                    Dim colore = ColorUtils.CalcolaColoreRainbow(punto.Value, minValue, maxValue)
-                    Dim c As Color = Color.FromArgb(colore.Alpha, colore.R, colore.G, colore.B)
-                    If x >= 0 AndAlso x < width AndAlso y >= 0 AndAlso y < height Then
-                        bmp.SetPixel(x, y, c)
+                    If punto.Longitude >= bounds.West AndAlso punto.Longitude <= bounds.East AndAlso
+               punto.Latitude >= bounds.South AndAlso punto.Latitude <= bounds.North Then
+
+                        Dim x = CInt(Math.Round((punto.Longitude - bounds.West) / (bounds.East - bounds.West) * width))
+                        Dim y = CInt(Math.Round((bounds.North - punto.Latitude) / (bounds.North - bounds.South) * height))
+                        Dim colore = ColorUtils.CalcolaColoreRainbow(punto.Value, minValue, maxValue)
+                        Dim c As Color = Color.FromArgb(colore.Alpha, colore.R, colore.G, colore.B)
+                        If x >= 0 AndAlso x < width AndAlso y >= 0 AndAlso y < height Then
+                            bmp.SetPixel(x, y, c)
+                        End If
                     End If
                 Next
             End Using
@@ -889,7 +1027,6 @@ Namespace DatiInterfOracleSpatial
         End Function
 
         'calcolare l’intersezione tra due bounds:
-
         Private Function IntersectBounds(b1 As BoundingBox, b2 As BoundingBox) As BoundingBox
             Dim north = Math.Min(b1.North, b2.North)
             Dim south = Math.Max(b1.South, b2.South)
@@ -900,6 +1037,64 @@ Namespace DatiInterfOracleSpatial
             Else
                 Return Nothing
             End If
+        End Function
+
+        ' Aggiorna i filtri a cascata
+        Private Sub AggiornaFiltri(Optional livello As Integer = 0)
+            Dim filtri As New Dictionary(Of String, List(Of String))
+            If livello > 0 AndAlso LstSt.SelectedItems.Count > 0 Then filtri("ST") = LstSt.SelectedItems.Cast(Of String).ToList()
+            If livello > 1 AndAlso LstStrada.SelectedItems.Count > 0 Then filtri("STRADA") = LstStrada.SelectedItems.Cast(Of String).ToList()
+            If livello > 2 AndAlso LstKmSito.SelectedItems.Count > 0 Then filtri("KM_SITO") = LstKmSito.SelectedItems.Cast(Of String).ToList()
+            If livello > 3 AndAlso LstSensore.SelectedItems.Count > 0 Then filtri("SENSORE") = LstSensore.SelectedItems.Cast(Of String).ToList()
+            If livello > 4 AndAlso LstPeriodo.SelectedItems.Count > 0 Then filtri("PERIODO") = LstPeriodo.SelectedItems.Cast(Of String).ToList()
+            If livello > 5 AndAlso LstTipo.SelectedItems.Count > 0 Then filtri("TIPO") = LstTipo.SelectedItems.Cast(Of String).ToList()
+            If livello > 6 AndAlso LstDirezione.SelectedItems.Count > 0 Then filtri("DIREZIONE") = LstDirezione.SelectedItems.Cast(Of String).ToList()
+
+            If livello <= 0 Then LstSt.ItemsSource = _oracleHelper.GetDistinctValuesMulti("GEO_ANAGRAFICA", "ST", New Dictionary(Of String, List(Of String)))
+            If livello <= 1 Then LstStrada.ItemsSource = _oracleHelper.GetDistinctValuesMulti("GEO_ANAGRAFICA", "STRADA", filtri)
+            If livello <= 2 Then LstKmSito.ItemsSource = _oracleHelper.GetDistinctValuesMulti("GEO_ANAGRAFICA", "KM_SITO", filtri)
+            If livello <= 3 Then LstSensore.ItemsSource = _oracleHelper.GetDistinctValuesMulti("GEO_ANAGRAFICA", "SENSORE", filtri)
+            If livello <= 4 Then LstPeriodo.ItemsSource = _oracleHelper.GetDistinctValuesMulti("GEO_ANAGRAFICA", "PERIODO", filtri)
+            If livello <= 5 Then LstTipo.ItemsSource = _oracleHelper.GetDistinctValuesMulti("GEO_ANAGRAFICA", "TIPO", filtri)
+            If livello <= 6 Then LstDirezione.ItemsSource = _oracleHelper.GetDistinctValuesMulti("GEO_ANAGRAFICA", "DIREZIONE", filtri)
+        End Sub
+
+        ' Evento per ogni filtro
+        Private Sub Filtro_SelectionChanged(sender As Object, e As SelectionChangedEventArgs)
+            Select Case True
+                Case sender Is LstSt
+                    AggiornaFiltri(1)
+                Case sender Is LstStrada
+                    AggiornaFiltri(2)
+                Case sender Is LstKmSito
+                    AggiornaFiltri(3)
+                Case sender Is LstSensore
+                    AggiornaFiltri(4)
+                Case sender Is LstPeriodo
+                    AggiornaFiltri(5)
+                Case sender Is LstTipo
+                    AggiornaFiltri(6)
+                Case sender Is LstDirezione
+                    ' Nessun filtro successivo
+            End Select
+        End Sub
+
+        ' Funzione helper per parsing robusto di double con separatore decimale variabile
+        Private Function ParseDoubleFlexible(input As Object) As Double
+            If input Is Nothing OrElse input Is DBNull.Value Then Return 0
+            Dim s As String = input.ToString().Trim()
+            If String.IsNullOrEmpty(s) Then Return 0
+            ' Normalizza sempre la virgola in punto
+            s = s.Replace(",", ".")
+            Dim result As Double = 0
+            If Double.TryParse(s, Globalization.NumberStyles.Any, Globalization.CultureInfo.InvariantCulture, result) Then
+                Return result
+            End If
+            ' Tentativo fallback con cultura corrente
+            If Double.TryParse(s, Globalization.NumberStyles.Any, Globalization.CultureInfo.CurrentCulture, result) Then
+                Return result
+            End If
+            Return 0
         End Function
 #End Region
 
@@ -957,47 +1152,31 @@ Namespace DatiInterfOracleSpatial
                         End If
                         Dim bounds = message.RootElement.GetProperty("bounds")
                         Dim viewportBox As New BoundingBox With {
-            .North = bounds.GetProperty("north").GetDouble(),
-            .South = bounds.GetProperty("south").GetDouble(),
-            .East = bounds.GetProperty("east").GetDouble(),
-            .West = bounds.GetProperty("west").GetDouble()
-        }
+    .North = ParseDoubleFlexible(bounds.GetProperty("north").ToString()),
+    .South = ParseDoubleFlexible(bounds.GetProperty("south").ToString()),
+    .East = ParseDoubleFlexible(bounds.GetProperty("east").ToString()),
+    .West = ParseDoubleFlexible(bounds.GetProperty("west").ToString())
+}
                         Static updateTimer As System.Threading.Timer = Nothing
                         If updateTimer IsNot Nothing Then updateTimer.Dispose()
                         updateTimer = New System.Threading.Timer(
             Sub(state)
                 Dispatcher.Invoke(Async Sub()
                                       Try
-                                          If CmbOrigineDato.SelectedIndex = 0 Then
-                                              ' -TUTTI-: carica overlay per tutti i bounds visibili nella viewport
-                                              Dim puntiTotali As New List(Of GeoPoint)
-                                              For Each bound In _allLoadedBounds
-                                                  Dim intersezione = IntersectBounds(bound, viewportBox)
-                                                  If intersezione IsNot Nothing Then
-                                                      _lastLoadedBounds = intersezione
-                                                      Dim punti = Await CaricaPuntiDaDB(intersezione, zoomLevel)
-                                                      puntiTotali.AddRange(punti)
-                                                  End If
-                                              Next
-                                              _lastLoadedBounds = CalcolaBounds(puntiTotali)
-                                              Await RenderPointsAsync(puntiTotali, zoomLevel)
-                                              MostraLegendaColorbar(COLOR_SCALE_MIN, COLOR_SCALE_MAX)
-                                              StatusText.Text = $"Visualizzati {puntiTotali.Count} punti (zoom {zoomLevel:F1})"
-                                          Else
-                                              ' Solo origine selezionata: carica solo i dati di quell'origine e solo per la porzione visibile
-                                              Dim idx As Integer = CmbOrigineDato.SelectedIndex - 1
-                                              Dim bound = _allLoadedBounds(idx)
+                                          ' Carica overlay per tutti i bounds visibili nella viewport
+                                          Dim puntiTotali As New List(Of GeoPoint)
+                                          For Each bound In _allLoadedBounds
                                               Dim intersezione = IntersectBounds(bound, viewportBox)
                                               If intersezione IsNot Nothing Then
                                                   _lastLoadedBounds = intersezione
-                                                  Await UpdateMapOverlayAsync(intersezione, zoomLevel)
-                                                  MostraLegendaColorbar(COLOR_SCALE_MIN, COLOR_SCALE_MAX)
-                                              Else
-                                                  ' Nessuna intersezione: svuota overlay
-                                                  Await RenderPointsAsync(New List(Of GeoPoint), zoomLevel)
-                                                  StatusText.Text = "Nessun dato visibile nell'area corrente"
+                                                  Dim punti = Await CaricaPuntiDaDB(intersezione, zoomLevel)
+                                                  puntiTotali.AddRange(punti)
                                               End If
-                                          End If
+                                          Next
+                                          _lastLoadedBounds = CalcolaBounds(puntiTotali)
+                                          Await RenderPointsAsync(puntiTotali, zoomLevel)
+                                          MostraLegendaColorbar(COLOR_SCALE_MIN, COLOR_SCALE_MAX)
+                                          StatusText.Text = $"Visualizzati {puntiTotali.Count} punti (zoom {zoomLevel:F1})"
                                       Catch ex As Exception
                                           LogDebug($"ERRORE autoaggiornamento overlay: {ex.Message}")
                                           StatusText.Text = "Errore autoaggiornamento overlay"
@@ -1039,8 +1218,8 @@ Namespace DatiInterfOracleSpatial
         Public Class MapConfiguration
             Public Property DefaultZoomLevel As Double = 6.0
             Public Property MaxPointsAtLowZoom As Integer = 100000
-            Public Property MaxPointsAtMediumZoom As Integer = 150000
-            Public Property MaxPointsAtHighZoom As Integer = 300000
+            Public Property MaxPointsAtMediumZoom As Integer = 100000
+            Public Property MaxPointsAtHighZoom As Integer = 100000
             Public Property AutoUpdateDelayMs As Integer = 1500
             Public Property MarkerOpacity As Double = 0.8
             Public Property HighZoomThreshold As Double = 15.0
@@ -1061,6 +1240,14 @@ Namespace DatiInterfOracleSpatial
                     Return SamplePercentLowZoom
                 End If
             End Function
+        End Class
+
+
+        Public Class JsBounds
+            Public Property north As Double
+            Public Property south As Double
+            Public Property east As Double
+            Public Property west As Double
         End Class
 #End Region
 

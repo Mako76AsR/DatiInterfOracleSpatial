@@ -375,17 +375,33 @@ async function createWebGLOverlay(puntiJSON, markerRadius, zoomLevel, bounds) {
     if (!window.deck) return false;
     if (window.pointsOverlay) window.pointsOverlay.setMap(null);
 
+    let punti;
     try {
-        let punti;
-        try {
-            if (puntiJSON.startsWith('"') && puntiJSON.endsWith('"')) {
-                puntiJSON = puntiJSON.substring(1, puntiJSON.length - 1);
-            }
-            punti = JSON.parse(puntiJSON);
-        } catch (e) {
-            punti = eval('(' + puntiJSON + ')');
+        if (puntiJSON.startsWith('"') && puntiJSON.endsWith('"')) {
+            puntiJSON = puntiJSON.substring(1, puntiJSON.length - 1);
         }
+        punti = JSON.parse(puntiJSON);
+    } catch (e) {
+        logToConsole("Errore parsing JSON punti: " + e.message);
+        window.chrome.webview.postMessage({
+            action: 'error',
+            message: 'Errore parsing JSON punti: ' + e.message
+        });
+        return false;
+    }
 
+    logToConsole("Lunghezza puntiJSON: " + puntiJSON.length + ", punti: " + (punti ? punti.length : 0));
+
+    if (punti.length > 100000) {
+        logToConsole("Troppi punti da visualizzare (" + punti.length + "). Visualizzazione annullata.");
+        window.chrome.webview.postMessage({
+            action: 'error',
+            message: 'Troppi punti da visualizzare: ' + punti.length
+        });
+        return false;
+    }
+
+    try {
         const timestamp = new Date().toISOString();
         window.pointsOverlay = new deck.GoogleMapsOverlay({
             layers: [
@@ -424,11 +440,19 @@ async function createWebGLOverlay(puntiJSON, markerRadius, zoomLevel, bounds) {
     }
 }
 
+
+
+function parseNumberFlexible(val) {
+    if (typeof val === "number") return val;
+    if (typeof val !== "string") return NaN;
+    // Normalizza la virgola in punto
+    return parseFloat(val.replace(',', '.'));
+}
 function highlightPoint(latitude, longitude) {
     return ensureDeckReady().then(() => {
         if (highlightOverlay) highlightOverlay.setMap(null);
-        const lat = parseFloat(latitude);
-        const lng = parseFloat(longitude);
+        const lat = parseNumberFlexible(latitude);
+        const lng = parseNumberFlexible(longitude);
         if (isNaN(lat) || isNaN(lng)) return false;
 
         try {
