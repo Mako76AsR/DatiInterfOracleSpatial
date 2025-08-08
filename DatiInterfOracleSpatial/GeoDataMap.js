@@ -333,17 +333,27 @@ function removeWebGLOverlay() {
     }
 }
 
-async function drawDeckBounds(bounds) {
+async function drawDeckBounds(boundsArray) {
     await ensureDeckReady();
     if (!window.deck) return;
     if (window.boundsOverlay) window.boundsOverlay.setMap(null);
+
+    // Se l'input non è un array, lo converte in array
+    if (!Array.isArray(boundsArray)) boundsArray = [boundsArray];
 
     try {
         window.boundsOverlay = new deck.GoogleMapsOverlay({
             layers: [
                 new deck.PolygonLayer({
                     id: 'bounds-polygon-static',
-                    data: [{ polygon: [[bounds.west, bounds.north], [bounds.east, bounds.north], [bounds.east, bounds.south], [bounds.west, bounds.south]] }],
+                    data: boundsArray.map(bounds => ({
+                        polygon: [
+                            [bounds.west, bounds.north],
+                            [bounds.east, bounds.north],
+                            [bounds.east, bounds.south],
+                            [bounds.west, bounds.south]
+                        ]
+                    })),
                     stroked: true,
                     filled: false,
                     pickable: false,
@@ -483,7 +493,12 @@ function removeGroundOverlays() {
 
 function showMapLoadingSpinner() {
     const el = document.getElementById('map-loading-spinner');
-    if (el) el.style.display = 'flex';
+    if (el) {
+        el.style.display = 'flex';
+        logToConsole('Spinner VISIBILE');
+    } else {
+        logToConsole('Spinner NON TROVATO');
+    }
 }
 function hideMapLoadingSpinner() {
     const el = document.getElementById('map-loading-spinner');

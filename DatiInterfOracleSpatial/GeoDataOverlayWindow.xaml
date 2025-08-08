@@ -12,6 +12,12 @@
 
         <!-- Barra superiore con pulsanti -->
         <StackPanel Orientation="Horizontal" Margin="8" Grid.Row="0">
+            <ComboBox x:Name="CmbOrigineDato"
+                      Width="180"
+                      Height="32"
+                      Margin="0,0,8,0"
+                      VerticalAlignment="Center"
+                      SelectedIndex="0"/>
             <Button x:Name="BtnCaricaDati"
                     Content="Carica GEO_DATI"
                     Width="120"
